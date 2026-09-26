@@ -765,3 +765,250 @@ describe("mapFinalResultForTest", () => {
     expect(result.errorMessage).toBe("boom");
   });
 });
+
+describe("dangerous command approvals", () => {
+  const RUN_URL = "/v1/runs/run-hermes-1";
+  const approvalFor = (requestId: string | null, command = "echo hi | grep hi") => ({
+    command,
+    description: "pipe to another command",
+    pattern_key: "pipe",
+    pattern_keys: ["pipe"],
+    choices: ["once", "session", "always", "deny"],
+    ...(requestId ? { request_id: requestId } : {}),
+  });
+
+  // Mocks a Hermes run whose GET /v1/runs/{id} walks through `statuses`, one per
+  // poll, holding on the last entry. SSE is unavailable, so the poll loop drives it.
+  function mockHermes(input: {
+    statuses:
+      | Array<Record<string, unknown>>
+      | ((poll: number, approvalPosts: Array<{ body: Record<string, unknown> }>) => Record<string, unknown>);
+    approvalResponse?: () => Response;
+    events?: string;
+    board?: (url: string, init?: RequestInit) => Response | null;
+  }) {
+    const approvalPosts: Array<{ body: Record<string, unknown>; headers: Record<string, string> }> = [];
+    let polls = 0;
+    const fetchMock = vi.fn(async (input_: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input_);
+      const boardResponse = input.board?.(url, init);
+      if (boardResponse) return boardResponse;
+      if (url.endsWith("/v1/runs")) {
+        return new Response(JSON.stringify({ run_id: "run-hermes-1", status: "started" }), { status: 200 });
+      }
+      if (url.endsWith(`${RUN_URL}/events`)) {
+        return input.events
+          ? new Response(sseStream(input.events), { status: 200, headers: { "content-type": "text/event-stream" } })
+          : new Response("no stream", { status: 503 });
+      }
+      if (url.endsWith(`${RUN_URL}/approval`)) {
+        approvalPosts.push({
+          body: JSON.parse(String(init?.body)),
+          headers: init?.headers as Record<string, string>,
+        });
+        return input.approvalResponse?.() ??
+          new Response(JSON.stringify({ object: "hermes.run.approval_response", run_id: "run-hermes-1", choice: "once", resolved: 1 }), { status: 200 });
+      }
+      if (url.endsWith(RUN_URL)) {
+        const status = typeof input.statuses === "function"
+          ? input.statuses(polls, approvalPosts)
+          : input.statuses[Math.min(polls, input.statuses.length - 1)];
+        polls += 1;
+        return new Response(JSON.stringify({ object: "hermes.run", run_id: "run-hermes-1", ...status }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return { fetchMock, approvalPosts };
+  }
+
+  const baseConfig = {
+    apiBaseUrl: "http://127.0.0.1:8642",
+    apiKey: "secret-key",
+    timeoutSec: 20,
+    pollIntervalMs: 250,
+  };
+
+  function approvalLogLines(ctx: AdapterExecutionContext): string[] {
+    return (ctx.onLog as ReturnType<typeof vi.fn>).mock.calls
+      .map(([, chunk]) => String(chunk))
+      .filter((chunk) => chunk.startsWith("[hermes-gateway:approval]"));
+  }
+
+  it("auto-approves once per request_id across running -> waiting_for_approval -> running -> completed", async () => {
+    const { approvalPosts } = mockHermes({
+      statuses: [
+        { status: "running" },
+        { status: "waiting_for_approval", approval: approvalFor("req-1") },
+        // Hermes has not processed the reply yet; the same request is still pending.
+        { status: "waiting_for_approval", approval: approvalFor("req-1") },
+        { status: "running" },
+        { status: "completed", output: "hi" },
+      ],
+    });
+    const ctx = makeCtx(baseConfig);
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.summary).toBe("hi");
+    expect(approvalPosts).toHaveLength(1);
+    expect(approvalPosts[0].body).toEqual({ choice: "once", request_id: "req-1" });
+    expect(approvalPosts[0].headers.Authorization).toBe("Bearer secret-key");
+    expect(approvalPosts[0].headers["Content-Type"]).toBe("application/json");
+    const decision = approvalLogLines(ctx).find((line) => line.includes("decision"));
+    expect(decision).toContain("choice=once");
+    expect(decision).toContain("reason=policy_auto_approve");
+    expect(decision).toContain("run=run-hermes-1");
+    expect(decision).toContain("request_id=req-1");
+    expect(decision).toContain(JSON.stringify("echo hi | grep hi"));
+    expect(decision).toContain(JSON.stringify("pipe to another command"));
+  });
+
+  it("answers each distinct request_id once", async () => {
+    const { approvalPosts } = mockHermes({
+      statuses: [
+        { status: "waiting_for_approval", approval: approvalFor("req-1") },
+        { status: "running" },
+        { status: "waiting_for_approval", approval: approvalFor("req-2", "python3 - <<'EOF'\nprint(1)\nEOF") },
+        { status: "completed", output: "done" },
+      ],
+    });
+
+    const result = await execute(makeCtx(baseConfig));
+
+    expect(result.exitCode).toBe(0);
+    expect(approvalPosts.map((post) => post.body.request_id)).toEqual(["req-1", "req-2"]);
+  });
+
+  it("denies commands that match the denylist regardless of policy", async () => {
+    const { approvalPosts } = mockHermes({
+      statuses: [
+        { status: "waiting_for_approval", approval: approvalFor("req-rm", "rm -rf / --no-preserve-root") },
+        { status: "completed", output: "done" },
+      ],
+    });
+    const ctx = makeCtx({ ...baseConfig, approvalDenylist: "rm\\s+-rf\\s+/(\\s|$)\n\\bmkfs\\b\n(" });
+
+    await execute(ctx);
+
+    expect(approvalPosts).toEqual([expect.objectContaining({ body: { choice: "deny", request_id: "req-rm" } })]);
+    expect(approvalLogLines(ctx).some((line) => line.includes("reason=denylist"))).toBe(true);
+  });
+
+  it("denies everything under the deny policy", async () => {
+    const { approvalPosts } = mockHermes({
+      statuses: [
+        { status: "waiting_for_approval", approval: approvalFor("req-1") },
+        { status: "completed", output: "done" },
+      ],
+    });
+
+    await execute(makeCtx({ ...baseConfig, approvalPolicy: "deny" }));
+
+    expect(approvalPosts.map((post) => post.body.choice)).toEqual(["deny"]);
+  });
+
+  it("does not double-answer when SSE and polling both see the same approval", async () => {
+    const { approvalPosts } = mockHermes({
+      events: [
+        "event: approval.request",
+        `data: ${JSON.stringify(approvalFor("req-sse"))}`,
+        "",
+        "",
+      ].join("\n"),
+      statuses: [
+        { status: "waiting_for_approval", approval: approvalFor("req-sse") },
+        { status: "running" },
+        { status: "completed", output: "done" },
+      ],
+    });
+
+    const result = await execute(makeCtx(baseConfig));
+
+    expect(result.exitCode).toBe(0);
+    expect(approvalPosts).toHaveLength(1);
+    expect(approvalPosts[0].body).toEqual({ choice: "once", request_id: "req-sse" });
+  });
+
+  it("treats 409 approval_not_pending as a benign race and keeps polling", async () => {
+    const { approvalPosts } = mockHermes({
+      statuses: [
+        { status: "waiting_for_approval", approval: approvalFor("req-1") },
+        { status: "completed", output: "done" },
+      ],
+      approvalResponse: () => new Response(JSON.stringify({ error: { code: "approval_not_pending" } }), { status: 409 }),
+    });
+    const ctx = makeCtx(baseConfig);
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    expect(approvalPosts).toHaveLength(1);
+    expect(approvalLogLines(ctx).some((line) => line.includes("nothing to resolve (approval_not_pending)"))).toBe(true);
+  });
+
+  it("asks the board with a request_confirmation card and approves once when accepted", async () => {
+    const boardCalls: Array<{ method: string; url: string; body: unknown; headers: Record<string, string> }> = [];
+    const { approvalPosts } = mockHermes({
+      statuses: (_poll, posts) =>
+        posts.length === 0
+          ? { status: "waiting_for_approval", approval: approvalFor("req-board") }
+          : { status: "completed", output: "done" },
+      board: (url, init) => {
+        if (!url.includes("/api/issues/issue-1/interactions")) return null;
+        const method = init?.method ?? "GET";
+        boardCalls.push({ method, url, body: init?.body ? JSON.parse(String(init.body)) : null, headers: init?.headers as Record<string, string> });
+        if (method === "POST") return new Response(JSON.stringify({ id: "int-1", status: "pending" }), { status: 201 });
+        return new Response(JSON.stringify([{ id: "int-1", status: "accepted" }]), { status: 200 });
+      },
+    });
+    const ctx = makeCtx({ ...baseConfig, approvalPolicy: "ask_board" });
+    ctx.authToken = "agent-run-jwt";
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    const created = boardCalls.find((call) => call.method === "POST");
+    expect(created?.body).toEqual(expect.objectContaining({
+      kind: "request_confirmation",
+      resolverPolicy: "human_only",
+      continuationPolicy: "none",
+      sourceRunId: "pc-run-1",
+    }));
+    expect(created?.headers.Authorization).toBe("Bearer agent-run-jwt");
+    expect(created?.headers["X-Paperclip-Run-Id"]).toBe("pc-run-1");
+    expect(approvalPosts).toEqual([expect.objectContaining({ body: { choice: "once", request_id: "req-board" } })]);
+  }, 15_000);
+
+  it("denies and withdraws the board card when nobody answers in time", async () => {
+    const boardCalls: Array<{ method: string; url: string }> = [];
+    const { approvalPosts } = mockHermes({
+      // Like Hermes, stay parked until a reply arrives, then finish.
+      statuses: (_poll, posts) =>
+        posts.length === 0
+          ? { status: "waiting_for_approval", approval: approvalFor("req-slow") }
+          : { status: "completed", output: "done" },
+      board: (url, init) => {
+        if (!url.includes("/api/issues/issue-1/interactions")) return null;
+        const method = init?.method ?? "GET";
+        boardCalls.push({ method, url });
+        if (method === "POST" && url.endsWith("/withdraw")) return new Response(JSON.stringify({ id: "int-2", status: "cancelled" }), { status: 200 });
+        if (method === "POST") return new Response(JSON.stringify({ id: "int-2", status: "pending" }), { status: 201 });
+        return new Response(JSON.stringify([{ id: "int-2", status: "pending" }]), { status: 200 });
+      },
+    });
+    // The minimum board timeout is 5s; the run timeout (3s) is shorter and
+    // would fire first unless it pauses while the decision is outstanding.
+    const ctx = makeCtx({ ...baseConfig, timeoutSec: 3, approvalPolicy: "ask_board", approvalBoardTimeoutSec: 5 });
+    ctx.authToken = "agent-run-jwt";
+
+    const result = await execute(ctx);
+
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(0);
+    expect(boardCalls.some((call) => call.method === "POST" && call.url.endsWith("/interactions/int-2/withdraw"))).toBe(true);
+    expect(approvalPosts).toEqual([expect.objectContaining({ body: { choice: "deny", request_id: "req-slow" } })]);
+    expect(approvalLogLines(ctx).some((line) => line.includes("reason=board_timeout"))).toBe(true);
+  }, 20_000);
+});

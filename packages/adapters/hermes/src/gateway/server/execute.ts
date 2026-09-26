@@ -14,6 +14,19 @@ import {
   stringifyPaperclipWakePayload,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
+  allowedChoice,
+  approvalBoardTimeoutSec,
+  approvalDedupeKey,
+  askBoard,
+  compileDenylist,
+  normalizeApprovalPolicy,
+  parseApprovalRequest,
+  type ApprovalChoice,
+  type ApprovalDecision,
+  type ApprovalPolicy,
+  type HermesApprovalRequest,
+} from "./approval.js";
+import {
   ADAPTER_TYPE,
   DEFAULT_EVENT_RECONNECT_MS,
   DEFAULT_POLL_INTERVAL_MS,
@@ -83,6 +96,11 @@ const TERMINAL_STATUSES = new Set([
   "stopped",
   "interrupted",
 ]);
+
+const WAITING_FOR_APPROVAL_STATUS = "waiting_for_approval";
+const APPROVAL_EVENT_NAME = "approval.request";
+const BENIGN_APPROVAL_CONFLICT_CODES = ["approval_not_active", "approval_not_pending"];
+const INVALID_APPROVAL_CHOICE_CODE = "invalid_approval_choice";
 
 const FAILURE_STATUSES = new Set(["failed", "error"]);
 const CANCELLED_STATUSES = new Set(["cancelled", "canceled", "stopped", "interrupted"]);
@@ -478,6 +496,7 @@ async function handleEvent(
   state: ExecutionState,
   frame: SseFrame,
   redactText: TextRedactor = sanitizeSensitiveText,
+  approvals?: ApprovalResponder,
 ): Promise<void> {
   const parsed = parseJsonData(frame.data);
   const record = asRecord(parsed);
@@ -493,6 +512,12 @@ async function handleEvent(
     const sanitizedDelta = redactText(delta);
     state.outputChunks.push(sanitizedDelta);
     await ctx.onLog("stdout", sanitizedDelta);
+  }
+
+  if (eventName === APPROVAL_EVENT_NAME) {
+    const request = parseApprovalRequest(parsed);
+    if (request) approvals?.handle(request);
+    return;
   }
 
   const status = extractStatus(parsed) ?? (eventName?.startsWith("run.") ? eventName.slice(4) : null);
@@ -522,6 +547,171 @@ async function delay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+type RunDeadline = {
+  promise: Promise<"timeout">;
+  pause: () => void;
+  resume: () => void;
+  clear: () => void;
+};
+
+// The run timeout pauses while an approval decision is outstanding, so time
+// spent waiting on our own reply never counts as the run making no progress.
+function createRunDeadline(timeoutMs: number): RunDeadline {
+  let resolveTimeout!: (value: "timeout") => void;
+  const promise = new Promise<"timeout">((resolve) => {
+    resolveTimeout = resolve;
+  });
+  let remainingMs = timeoutMs;
+  let armedAt = Date.now();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let pauseDepth = 0;
+  const arm = () => {
+    if (timeoutMs <= 0) return;
+    armedAt = Date.now();
+    timer = setTimeout(() => resolveTimeout("timeout"), remainingMs);
+  };
+  arm();
+  return {
+    promise,
+    pause: () => {
+      if (timeoutMs <= 0 || pauseDepth++ > 0) return;
+      if (timer) clearTimeout(timer);
+      timer = null;
+      remainingMs = Math.max(0, remainingMs - (Date.now() - armedAt));
+    },
+    resume: () => {
+      if (timeoutMs <= 0 || pauseDepth === 0 || --pauseDepth > 0) return;
+      arm();
+    },
+    clear: () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+    },
+  };
+}
+
+type ApprovalResponder = {
+  /** Answers a pending Hermes approval. Each request is answered at most once. */
+  handle: (request: HermesApprovalRequest) => void;
+  /** Tracks run status so approvals without a request_id are keyed per waiting episode. */
+  noteStatus: (status: string | null) => void;
+  /** Resolves once every in-flight decision has been sent. */
+  settled: () => Promise<void>;
+};
+
+function approvalErrorCode(body: unknown): string | null {
+  const text = JSON.stringify(body ?? "");
+  return [...BENIGN_APPROVAL_CONFLICT_CODES, INVALID_APPROVAL_CHOICE_CODE].find((code) => text.includes(code)) ?? null;
+}
+
+function createApprovalResponder(input: {
+  ctx: AdapterExecutionContext;
+  baseUrl: URL;
+  headers: Record<string, string>;
+  state: ExecutionState;
+  signal: AbortSignal;
+  deadline: RunDeadline;
+  policy: ApprovalPolicy;
+  denylist: RegExp[];
+  boardTimeoutSec: number;
+  redactText: TextRedactor;
+}): ApprovalResponder {
+  const handled = new Set<string>();
+  const inFlight = new Set<Promise<void>>();
+  let episode = 0;
+  let answeredThisEpisode = false;
+  const hermesRunId = input.state.runId;
+  const approvalUrl = apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(hermesRunId)}/approval`);
+
+  const describe = (request: HermesApprovalRequest) =>
+    `run=${hermesRunId} request_id=${request.requestId ?? "-"} command=${JSON.stringify(input.redactText(request.command ?? ""))} description=${JSON.stringify(input.redactText(request.description ?? ""))}`;
+
+  const decide = async (request: HermesApprovalRequest, dedupeKey: string): Promise<ApprovalDecision> => {
+    const command = request.command ?? "";
+    const denied = input.denylist.find((pattern) => pattern.test(command));
+    if (denied) return { choice: "deny", reason: "denylist", detail: `matched /${denied.source}/` };
+    if (input.policy === "deny") return { choice: "deny", reason: "policy_deny" };
+    if (input.policy === "auto_approve") return { choice: "once", reason: "policy_auto_approve" };
+    await input.ctx.onLog("stdout", `[hermes-gateway:approval] asking board (timeout ${input.boardTimeoutSec}s) ${describe(request)}\n`);
+    return askBoard({
+      ctx: input.ctx,
+      hermesRunId,
+      request,
+      dedupeKey,
+      timeoutSec: input.boardTimeoutSec,
+      signal: input.signal,
+      redact: input.redactText,
+      onKeepalive: (waitedMs) =>
+        input.ctx.onLog("stdout", `[hermes-gateway:approval] still waiting for board decision (${Math.round(waitedMs / 1000)}s) run=${hermesRunId}\n`),
+    });
+  };
+
+  const send = async (choice: ApprovalChoice, request: HermesApprovalRequest): Promise<{ ok: boolean; status: number; code: string | null; body: unknown }> => {
+    const response = await fetch(approvalUrl, {
+      method: "POST",
+      headers: { ...input.headers, "Idempotency-Key": `${input.ctx.runId}:approval:${request.requestId ?? episode}:${choice}` },
+      signal: input.signal,
+      body: JSON.stringify({ choice, ...(request.requestId ? { request_id: request.requestId } : {}) }),
+    });
+    const body = await readResponseJson(response);
+    return { ok: response.ok, status: response.status, code: response.ok ? null : approvalErrorCode(body), body };
+  };
+
+  const respond = async (request: HermesApprovalRequest, dedupeKey: string) => {
+    input.deadline.pause();
+    try {
+      const decision = await decide(request, dedupeKey);
+      const choice = allowedChoice(decision.choice, request);
+      await input.ctx.onLog(
+        "stdout",
+        `[hermes-gateway:approval] decision choice=${choice} reason=${decision.reason}${decision.detail ? ` detail=${JSON.stringify(input.redactText(decision.detail))}` : ""} ${describe(request)}\n`,
+      );
+      if (input.signal.aborted) return;
+      let result = await send(choice, request);
+      if (!result.ok && result.code === INVALID_APPROVAL_CHOICE_CODE && choice !== "deny" && choice !== "once") {
+        await input.ctx.onLog("stdout", `[hermes-gateway:approval] choice ${choice} not allowed; falling back to once run=${hermesRunId}\n`);
+        result = await send("once", request);
+      }
+      if (result.ok) {
+        const resolved = asRecord(result.body)?.resolved;
+        await input.ctx.onLog("stdout", `[hermes-gateway:approval] sent choice=${choice} resolved=${resolved ?? "?"} run=${hermesRunId}\n`);
+      } else if (result.status === 409 && result.code && BENIGN_APPROVAL_CONFLICT_CODES.includes(result.code)) {
+        await input.ctx.onLog("stdout", `[hermes-gateway:approval] nothing to resolve (${result.code}); continuing run=${hermesRunId}\n`);
+      } else {
+        await input.ctx.onLog(
+          "stderr",
+          `[hermes-gateway:approval] reply failed HTTP ${result.status}: ${stringifyForLog(redactForLog(result.body, [], 0, input.redactText), 1_000)} run=${hermesRunId}\n`,
+        );
+      }
+    } catch (err) {
+      if (input.signal.aborted) return;
+      await input.ctx.onLog("stderr", `[hermes-gateway:approval] reply failed: ${redactErrorMessage(err, input.redactText)} ${describe(request)}\n`);
+    } finally {
+      input.deadline.resume();
+    }
+  };
+
+  return {
+    handle: (request) => {
+      const dedupeKey = approvalDedupeKey(request, episode);
+      if (handled.has(dedupeKey)) return;
+      handled.add(dedupeKey);
+      answeredThisEpisode = true;
+      const task = respond(request, dedupeKey).finally(() => inFlight.delete(task));
+      inFlight.add(task);
+    },
+    noteStatus: (status) => {
+      if (status !== WAITING_FOR_APPROVAL_STATUS && answeredThisEpisode) {
+        episode += 1;
+        answeredThisEpisode = false;
+      }
+    },
+    settled: async () => {
+      await Promise.allSettled([...inFlight]);
+    },
+  };
+}
+
 async function pollStatus(input: {
   ctx: AdapterExecutionContext;
   baseUrl: URL;
@@ -530,6 +720,7 @@ async function pollStatus(input: {
   signal: AbortSignal;
   intervalMs: number;
   redactText?: TextRedactor;
+  approvals?: ApprovalResponder;
 }): Promise<void> {
   while (!input.signal.aborted && !input.state.terminal) {
     await delay(input.intervalMs, input.signal);
@@ -541,6 +732,11 @@ async function pollStatus(input: {
         signal: input.signal,
       });
       const normalized = extractStatus(status);
+      input.approvals?.noteStatus(normalized);
+      if (normalized === WAITING_FOR_APPROVAL_STATUS) {
+        const request = parseApprovalRequest(asRecord(status)?.approval);
+        if (request) input.approvals?.handle(request);
+      }
       if (normalized && TERMINAL_STATUSES.has(normalized)) {
         markTerminal(input.state, {
           runId: input.state.runId,
@@ -564,6 +760,7 @@ async function consumeEvents(input: {
   signal: AbortSignal;
   reconnectMs: number;
   redactText?: TextRedactor;
+  approvals?: ApprovalResponder;
 }): Promise<void> {
   while (!input.signal.aborted && !input.state.terminal) {
     try {
@@ -592,7 +789,7 @@ async function consumeEvents(input: {
             const parsed = parseSseFramesForTest(`${buffer}\n\n`);
             buffer = parsed.rest;
             for (const frame of parsed.frames) {
-              await handleEvent(input.ctx, input.state, frame, input.redactText);
+              await handleEvent(input.ctx, input.state, frame, input.redactText, input.approvals);
               if (input.state.terminal) break;
             }
           }
@@ -602,7 +799,7 @@ async function consumeEvents(input: {
         const parsed = parseSseFramesForTest(buffer);
         buffer = parsed.rest;
         for (const frame of parsed.frames) {
-          await handleEvent(input.ctx, input.state, frame, input.redactText);
+          await handleEvent(input.ctx, input.state, frame, input.redactText, input.approvals);
           if (input.state.terminal) break;
         }
       }
@@ -858,6 +1055,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   ]);
   const body = buildRunBody(ctx, sessionKey);
   const createRunUrl = apiUrl(baseUrl, "/v1/runs");
+  const approvalPolicy = normalizeApprovalPolicy(ctx.config.approvalPolicy);
+  const denylist = compileDenylist(ctx.config.approvalDenylist);
+  const boardTimeoutSec = approvalBoardTimeoutSec(ctx.config.approvalBoardTimeoutSec);
 
   await ctx.onMeta?.({
     adapterType: ADAPTER_TYPE,
@@ -869,10 +1069,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       eventReconnectMs: reconnectMs,
       sessionKeyStrategy: strategy,
       hasSessionKey: Boolean(sessionKey),
+      approvalPolicy,
+      approvalDenylistPatterns: denylist.patterns.length,
     },
   });
   await ctx.onLog("stdout", `[hermes-gateway] creating run at ${createRunUrl} (timeout=${timeoutSec}s, session=${strategy})\n`);
   await ctx.onLog("stdout", `[hermes-gateway] request headers (redacted): ${stringifyForLog(redactForLog(runHeaders, [], 0, redactText), 3_000)}\n`);
+  await ctx.onLog(
+    "stdout",
+    `[hermes-gateway] approval policy=${approvalPolicy} denylist=${denylist.patterns.length} pattern(s)${approvalPolicy === "ask_board" ? ` board_timeout=${boardTimeoutSec}s` : ""}\n`,
+  );
+  if (denylist.invalid.length > 0) {
+    await ctx.onLog("stderr", `[hermes-gateway] ignoring invalid approvalDenylist regex(es): ${JSON.stringify(denylist.invalid)}\n`);
+  }
 
   let runId: string | null = null;
   try {
@@ -904,6 +1113,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const state = createExecutionState(runId);
   const controller = new AbortController();
+  const deadline = createRunDeadline(timeoutMs);
+  const approvals = createApprovalResponder({
+    ctx,
+    baseUrl,
+    headers: runHeaders,
+    state,
+    signal: controller.signal,
+    deadline,
+    policy: approvalPolicy,
+    denylist: denylist.patterns,
+    boardTimeoutSec,
+    redactText,
+  });
   void consumeEvents({
     ctx,
     baseUrl,
@@ -912,6 +1134,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     signal: controller.signal,
     reconnectMs,
     redactText,
+    approvals,
   }).catch(() => undefined);
   void pollStatus({
     ctx,
@@ -921,17 +1144,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     signal: controller.signal,
     intervalMs: pollIntervalMs,
     redactText,
+    approvals,
   }).catch(() => undefined);
 
-  let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
-  const timeoutPromise = new Promise<"timeout">((resolve) => {
-    if (timeoutMs <= 0) return;
-    timeoutTimer = setTimeout(() => resolve("timeout"), timeoutMs);
-  });
-
-  const outcome = await Promise.race([state.terminalPromise, timeoutPromise]);
-  if (timeoutTimer) clearTimeout(timeoutTimer);
+  const outcome = await Promise.race([state.terminalPromise, deadline.promise]);
+  deadline.clear();
   controller.abort();
+  await approvals.settled();
 
   if (outcome === "timeout") {
     await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });

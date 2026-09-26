@@ -1,5 +1,10 @@
 import type { AdapterConfigSchema } from "@paperclipai/adapter-utils";
-import { DEFAULT_EVENT_RECONNECT_MS, DEFAULT_TIMEOUT_SEC } from "../shared/constants.js";
+import {
+  DEFAULT_APPROVAL_BOARD_TIMEOUT_SEC,
+  DEFAULT_APPROVAL_POLICY,
+  DEFAULT_EVENT_RECONNECT_MS,
+  DEFAULT_TIMEOUT_SEC,
+} from "../shared/constants.js";
 import { INSECURE_REMOTE_HTTP_ESCAPE_HATCH } from "./transport-security.js";
 
 export function getConfigSchema(): AdapterConfigSchema {
@@ -45,6 +50,31 @@ export function getConfigSchema(): AdapterConfigSchema {
         label: "Timeout seconds",
         type: "number",
         default: DEFAULT_TIMEOUT_SEC,
+      },
+      {
+        key: "approvalPolicy",
+        label: "Dangerous command approvals",
+        type: "select",
+        default: DEFAULT_APPROVAL_POLICY,
+        options: [
+          { value: "auto_approve", label: "Auto-approve once" },
+          { value: "deny", label: "Deny" },
+          { value: "ask_board", label: "Ask board" },
+        ],
+        hint: "How to answer when Hermes pauses a run for a command it flags as dangerous. Auto-approve answers \"once\", so every flagged command is still checked individually. Ask board posts a confirmation on the issue and denies if nobody answers in time.",
+      },
+      {
+        key: "approvalDenylist",
+        label: "Approval denylist",
+        type: "textarea",
+        hint: "Optional. One regular expression per line, matched against the flagged command. A match is always denied, whatever the policy. Example: rm\\s+-rf\\s+/(\\s|$), \\bmkfs\\b, \\bdd\\b.*\\bof=/dev/",
+      },
+      {
+        key: "approvalBoardTimeoutSec",
+        label: "Ask board timeout seconds",
+        type: "number",
+        default: DEFAULT_APPROVAL_BOARD_TIMEOUT_SEC,
+        hint: "Ask board only. How long to wait for a board answer before denying. The run timeout pauses while waiting.",
       },
       {
         key: "eventReconnectMs",
